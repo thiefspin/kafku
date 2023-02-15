@@ -1,0 +1,5 @@
+#!/bin/bash 
+for ((i=1;i<=20;i++))
+do
+    kafka-topics --bootstrap-server localhost:9092 --topic test-topic-$i --create --partitions 5 --replication-factor 1
+done
