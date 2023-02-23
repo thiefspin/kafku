@@ -38,6 +38,11 @@ impl SimpleKafkaClient {
             .collect();
     }
 
+    pub fn list_brokers(&self) -> Vec<String> {
+        let mut client = self.create();
+        return client.hosts().to_owned();
+    }
+
     fn get_offsets(&self, topic: String ) -> Vec<PartitionOffset> {
         let mut client = self.create();
         client.load_metadata_all().unwrap();
@@ -77,18 +82,20 @@ impl SimpleKafkaClient {
             .collect()
     }
 
-    pub fn create_consumer(&self, topic: &str, partition: i32) -> Consumer {
-        println!("Consumer group set to {}", whoami::username());
+    pub fn create_consumer(&self, topic: &str) -> Consumer {
+        // println!("Consumer group set to {}", whoami::username());
         Consumer::from_hosts(self.hosts.clone())
-            .with_topic_partitions(topic.to_owned(), &[partition])
+        .with_topic(topic.to_owned())
+            // .with_topic_partitions(topic.to_owned(), &[partition])
             .with_fallback_offset(FetchOffset::Earliest)
-            .with_group(whoami::username().to_owned())
+            // .with_group(whoami::username().to_owned())
+            .with_group("somegroup3".to_owned())
             .with_offset_storage(GroupOffsetStorage::Kafka)
             .create()
             .unwrap()
     }
 
-    pub fn start_consumer(&self, mut consumer: Consumer, f: &dyn Fn(String) -> ()) {
+    pub fn start_consumer(&self, mut consumer: Consumer, f: &mut dyn FnMut(std::string::String)) {
         loop {
             for ms in consumer.poll().unwrap().iter() {
                 for m in ms.messages() {
@@ -119,6 +126,6 @@ impl SimpleKafkaClient {
     }
 }
 
-fn parse_message(message_bytes: &[u8]) -> String {
+pub fn parse_message(message_bytes: &[u8]) -> String {
     str::from_utf8(&message_bytes).unwrap().to_owned()
 }

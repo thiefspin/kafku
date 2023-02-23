@@ -1,4 +1,4 @@
-use crate::config::KafkaConfig;
+use crate::{config::KafkaConfig, kafka_client::parse_message};
 use crate::kafka_client::SimpleKafkaClient;
 use chrono::prelude::*;
 use crossterm::{
@@ -29,16 +29,6 @@ use tui::{
 mod config;
 mod kafka_client;
 
-const DB_PATH: &str = "./data/db.json";
-
-#[derive(Error, Debug)]
-pub enum Error {
-    #[error("error reading the DB file: {0}")]
-    ReadDBError(#[from] io::Error),
-    #[error("error parsing the DB file: {0}")]
-    ParseDBError(#[from] serde_json::Error),
-}
-
 enum Event<I> {
     Input(I),
     Tick,
@@ -55,24 +45,20 @@ struct User {
 
 #[derive(Copy, Clone, Debug)]
 enum MenuItem {
-    Home,
-    Users,
     Topics,
 }
 
 impl From<MenuItem> for usize {
     fn from(input: MenuItem) -> usize {
         match input {
-            MenuItem::Home => 0,
-            MenuItem::Users => 1,
-            MenuItem::Topics => 2,
+            MenuItem::Topics => 0,
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let kafka_config = config::get(args[1].to_string()).unwrap();
+    let kafka_config: KafkaConfig = config::get(args[1].to_string()).unwrap();
 
     println!("Using host: {}", kafka_config.broker());
 
@@ -113,11 +99,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let menu_titles = vec!["Home", "Users", "Add", "Delete", "Topics", "Quit"];
-    let mut active_menu_item = MenuItem::Home;
-    let mut user_list_state = ListState::default();
+    let menu_titles = vec!["Topics", "Pull", "Clear", "Quit"];
+    let mut active_menu_item = MenuItem::Topics;
     let mut topic_list_state = ListState::default();
-    user_list_state.select(Some(0));
+    let mut msgs: Vec<String> = vec![];
     topic_list_state.select(Some(0));
 
     loop {
@@ -129,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .constraints(
                     [
                         Constraint::Length(3),
+                        Constraint::Length(3),
                         Constraint::Min(2),
                         Constraint::Length(3),
                     ]
@@ -136,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .split(size);
 
-            let copyright = Paragraph::new("User-CLI 2023 - all rights reserved")
+            let copyright = Paragraph::new("Kafka-CLI 2023 - all rights reserved")
                 .style(Style::default().fg(Color::LightCyan))
                 .alignment(Alignment::Center)
                 .block(
@@ -170,33 +156,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .highlight_style(Style::default().fg(Color::Yellow))
                 .divider(Span::raw("|"));
 
+            let hosts = Spans::from(vec![Span::styled(
+                broker_info_label(client.list_brokers()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::UNDERLINED),
+            )]);
+
+            let topic_num = Spans::from(vec![Span::styled(
+                num_topics_label(client.list_topics().len()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::UNDERLINED),
+            )]);
+
+            let info_tab = Tabs::new(vec![hosts, topic_num])
+                .block(Block::default().title("Info").borders(Borders::ALL))
+                .style(Style::default().fg(Color::White))
+                .highlight_style(Style::default().fg(Color::Yellow))
+                .divider(Span::raw("|"));
+
             rect.render_widget(tabs, chunks[0]);
+            rect.render_widget(info_tab, chunks[1]);
             match active_menu_item {
-                MenuItem::Home => rect.render_widget(render_home(), chunks[1]),
                 MenuItem::Topics => {
                     let topics_chunks = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints(
-                            [Constraint::Percentage(20), Constraint::Percentage(80)].as_ref(),
+                            [
+                                Constraint::Percentage(20),
+                                Constraint::Percentage(40),
+                                Constraint::Percentage(40),
+                            ]
+                            .as_ref(),
                         )
-                        .split(chunks[1]);
+                        .split(chunks[2]);
                     let (left, right) = render_topics(&topic_list_state, topic_list.clone());
+                    let messages = messages_block(msgs.clone());
                     rect.render_stateful_widget(left, topics_chunks[0], &mut topic_list_state);
                     rect.render_widget(right, topics_chunks[1]);
-                }
-                MenuItem::Users => {
-                    let users_chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints(
-                            [Constraint::Percentage(20), Constraint::Percentage(80)].as_ref(),
-                        )
-                        .split(chunks[1]);
-                    let (left, right) = render_users(&user_list_state);
-                    rect.render_stateful_widget(left, users_chunks[0], &mut user_list_state);
-                    rect.render_widget(right, users_chunks[1]);
+                    rect.render_widget(messages, topics_chunks[2]);
                 }
             }
-            rect.render_widget(copyright, chunks[2]);
+            rect.render_widget(copyright, chunks[3]);
         })?;
 
         match rx.recv()? {
@@ -206,26 +208,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     terminal.show_cursor()?;
                     break;
                 }
-                KeyCode::Char('h') => active_menu_item = MenuItem::Home,
-                KeyCode::Char('u') => active_menu_item = MenuItem::Users,
                 KeyCode::Char('t') => active_menu_item = MenuItem::Topics,
-                KeyCode::Char('a') => {
-                    add_random_user_to_db().expect("can add new random user");
-                }
-                KeyCode::Char('d') => {
-                    remove_user_at_index(&mut user_list_state).expect("can remove user");
+                KeyCode::Char('c') =>  {
+                    msgs.clear();
+                },
+                KeyCode::Char('p') => {
+                    let selected = get_selected_topic(&topic_list_state.clone(), topic_list.clone()).name;
+                    let mut consumer = client.create_consumer(&selected);
+                    for ms in consumer.poll().unwrap().iter() {
+                        for m in ms.messages() {
+                            let message = parse_message(m.value);
+                            msgs.push(message)
+                        }
+                        consumer.consume_messageset(ms).unwrap();
+                    }
+                    consumer.commit_consumed().unwrap();
                 }
                 KeyCode::Down => match active_menu_item {
-                    MenuItem::Users => {
-                        if let Some(selected) = user_list_state.selected() {
-                            let amount_users = read_db().expect("can fetch user list").len();
-                            if selected >= amount_users - 1 {
-                                user_list_state.select(Some(0));
-                            } else {
-                                user_list_state.select(Some(selected + 1));
-                            }
-                        }
-                    }
                     MenuItem::Topics => {
                         if let Some(selected) = topic_list_state.selected() {
                             let amount_topics = topic_list.len();
@@ -239,16 +238,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 },
                 KeyCode::Up => match active_menu_item {
-                    MenuItem::Users => {
-                        if let Some(selected) = user_list_state.selected() {
-                            let amount_users = read_db().expect("can fetch user list").len();
-                            if selected > 0 {
-                                user_list_state.select(Some(selected - 1));
-                            } else {
-                                user_list_state.select(Some(amount_users - 1));
-                            }
-                        }
-                    }
                     MenuItem::Topics => {
                         if let Some(selected) = topic_list_state.selected() {
                             let amount_topics = topic_list.len();
@@ -270,6 +259,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn messages_block<'a>(msgs: Vec<String>) -> List<'a> {
+    let heading = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().fg(Color::White))
+        .title("Messages")
+        .border_type(BorderType::Plain);
+
+    let items: Vec<_> = msgs
+        .iter()
+        .map(|msg| {
+            ListItem::new(Spans::from(vec![Span::styled(
+                msg.clone(),
+                Style::default(),
+            )]))
+        })
+        .collect();
+    return List::new(items).block(heading).highlight_style(
+        Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+fn broker_info_label(brokers: Vec<String>) -> String {
+    return format!("{} {}", "Brokers:", brokers.join(", "));
+}
+
+fn num_topics_label(num: usize) -> String {
+    return format!("{} {}", "Number of Topics:", num.to_string());
+}
+
+fn get_selected_topic(topic_list_state: &ListState, topic_list: Vec<TopicData>) -> TopicData {
+    return topic_list
+        .get(
+            topic_list_state
+                .selected()
+                .expect("there is always a selected topic"),
+        )
+        .expect("exists")
+        .clone();
+}
+
 fn render_topics<'a>(
     topic_list_state: &ListState,
     topic_list: Vec<TopicData>,
@@ -280,7 +312,6 @@ fn render_topics<'a>(
         .title("Topics")
         .border_type(BorderType::Plain);
 
-    // let user_list = read_db().expect("can fetch user list");
     let items: Vec<_> = topic_list
         .iter()
         .map(|topic| {
@@ -291,14 +322,7 @@ fn render_topics<'a>(
         })
         .collect();
 
-    let selected_topic = topic_list
-        .get(
-            topic_list_state
-                .selected()
-                .expect("there is always a selected topic"),
-        )
-        .expect("exists")
-        .clone();
+    let selected_topic = get_selected_topic(topic_list_state, topic_list);
 
     let list = List::new(items).block(topics).highlight_style(
         Style::default()
@@ -307,249 +331,52 @@ fn render_topics<'a>(
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows: Vec<Row> = selected_topic.partitions.iter().map(|p| {
-        Row::new(vec![
-            Cell::from(Span::raw(p.id.to_string())),
-            Cell::from(Span::raw(p.leader.to_string())),
-            Cell::from(Span::raw(p.available.to_string())),
-            Cell::from(Span::raw(p.offset.to_string()))
-        ])
-    }).collect();
-
-    let topic_detail = Table::new(rows).header(Row::new(vec![
-        Cell::from(Span::styled(
-            "Partition Id",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(
-            "Leader",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(
-            "Available",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(
-            "Offset",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .style(Style::default().fg(Color::White))
-            .title("Detail")
-            .border_type(BorderType::Plain),
-    )
-    .widths(&[
-        Constraint::Percentage(20),
-        Constraint::Percentage(20),
-        Constraint::Percentage(20),
-        Constraint::Percentage(5),
-        Constraint::Percentage(5),
-    ]);
-
-    (list, topic_detail)
-
-    // let topic_detail = Table::new(vec![Row::new(vec![
-    //     Cell::from(Span::raw(selected_topic.)),
-    //     Cell::from(Span::raw("Topic detail 2")),
-    //     Cell::from(Span::raw("Topic detail 2")),
-    //     Cell::from(Span::raw("Topic detail 2")),
-    //     Cell::from(Span::raw("Topic detail 2")),
-    // ])])
-    // let topic_detail = Table::new(vec![Row::new(vec![
-    //     Cell::from(Span::raw(selected_topic.id.to_string())),
-    //     Cell::from(Span::raw(selected_topic.name)),
-    //     Cell::from(Span::raw(selected_topic.role)),
-    //     Cell::from(Span::raw(selected_topic.age.to_string())),
-    //     Cell::from(Span::raw(selected_topic.created_at.to_string())),
-    // ])])
-    // .header(Row::new(vec![
-    //     Cell::from(Span::styled(
-    //         "Name",
-    //         Style::default().add_modifier(Modifier::BOLD),
-    //     )),
-    //     Cell::from(Span::styled(
-    //         "Name",
-    //         Style::default().add_modifier(Modifier::BOLD),
-    //     )),
-    //     Cell::from(Span::styled(
-    //         "Category",
-    //         Style::default().add_modifier(Modifier::BOLD),
-    //     )),
-    //     Cell::from(Span::styled(
-    //         "Age",
-    //         Style::default().add_modifier(Modifier::BOLD),
-    //     )),
-    //     Cell::from(Span::styled(
-    //         "Created At",
-    //         Style::default().add_modifier(Modifier::BOLD),
-    //     )),
-    // ]))
-    // .block(
-    //     Block::default()
-    //         .borders(Borders::ALL)
-    //         .style(Style::default().fg(Color::White))
-    //         .title("Detail")
-    //         .border_type(BorderType::Plain),
-    // )
-    // .widths(&[
-    //     Constraint::Percentage(20),
-    //     Constraint::Percentage(20),
-    //     Constraint::Percentage(20),
-    //     Constraint::Percentage(5),
-    //     Constraint::Percentage(5),
-    // ]);
-
-    // (list, topic_detail)
-}
-
-fn render_home<'a>() -> Paragraph<'a> {
-    let home = Paragraph::new(vec![
-        Spans::from(vec![Span::raw("")]),
-        Spans::from(vec![Span::raw("Welcome")]),
-        Spans::from(vec![Span::raw("")]),
-        Spans::from(vec![Span::raw("to")]),
-        Spans::from(vec![Span::raw("")]),
-        Spans::from(vec![Span::styled(
-            "user-CLI",
-            Style::default().fg(Color::LightBlue),
-        )]),
-        Spans::from(vec![Span::raw("")]),
-        Spans::from(vec![Span::raw("Press 'u' to access users, 'a' to add random new users and 'd' to delete the currently selected user.")]),
-    ])
-    .alignment(Alignment::Center)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .style(Style::default().fg(Color::White))
-            .title("Home")
-            .border_type(BorderType::Plain),
-    );
-    home
-}
-
-fn render_users<'a>(user_list_state: &ListState) -> (List<'a>, Table<'a>) {
-    let users = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().fg(Color::White))
-        .title("Users")
-        .border_type(BorderType::Plain);
-
-    let user_list = read_db().expect("can fetch user list");
-    let items: Vec<_> = user_list
+    let rows: Vec<Row> = selected_topic
+        .partitions
         .iter()
-        .map(|user| {
-            ListItem::new(Spans::from(vec![Span::styled(
-                user.name.clone(),
-                Style::default(),
-            )]))
+        .map(|p| {
+            Row::new(vec![
+                Cell::from(Span::raw(p.id.to_string())),
+                Cell::from(Span::raw(p.leader.to_string())),
+                Cell::from(Span::raw(p.available.to_string())),
+                Cell::from(Span::raw(p.offset.to_string())),
+            ])
         })
         .collect();
 
-    let selected_user = user_list
-        .get(
-            user_list_state
-                .selected()
-                .expect("there is always a selected user"),
+    let topic_detail = Table::new(rows)
+        .header(Row::new(vec![
+            Cell::from(Span::styled(
+                "Partition Id",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Cell::from(Span::styled(
+                "Leader",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Cell::from(Span::styled(
+                "Available",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Cell::from(Span::styled(
+                "Offset",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::White))
+                .title("Detail")
+                .border_type(BorderType::Plain),
         )
-        .expect("exists")
-        .clone();
+        .widths(&[
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(5),
+            Constraint::Percentage(5),
+        ]);
 
-    let list = List::new(items).block(users).highlight_style(
-        Style::default()
-            .bg(Color::Yellow)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD),
-    );
-
-    let user_detail = Table::new(vec![Row::new(vec![
-        Cell::from(Span::raw(selected_user.id.to_string())),
-        Cell::from(Span::raw(selected_user.name)),
-        Cell::from(Span::raw(selected_user.role)),
-        Cell::from(Span::raw(selected_user.age.to_string())),
-        Cell::from(Span::raw(selected_user.created_at.to_string())),
-    ])])
-    .header(Row::new(vec![
-        Cell::from(Span::styled(
-            "ID",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(
-            "Name",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(
-            "Category",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(
-            "Age",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(
-            "Created At",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .style(Style::default().fg(Color::White))
-            .title("Detail")
-            .border_type(BorderType::Plain),
-    )
-    .widths(&[
-        Constraint::Percentage(5),
-        Constraint::Percentage(20),
-        Constraint::Percentage(20),
-        Constraint::Percentage(5),
-        Constraint::Percentage(20),
-    ]);
-
-    (list, user_detail)
-}
-
-fn read_db() -> Result<Vec<User>, Error> {
-    let db_content = fs::read_to_string(DB_PATH)?;
-    let parsed: Vec<User> = serde_json::from_str(&db_content)?;
-    Ok(parsed)
-}
-
-fn add_random_user_to_db() -> Result<Vec<User>, Error> {
-    let mut rng = rand::thread_rng();
-    let db_content = fs::read_to_string(DB_PATH)?;
-    let mut parsed: Vec<User> = serde_json::from_str(&db_content)?;
-    let admin_user = match rng.gen_range(0, 1) {
-        0 => "Admin",
-        _ => "User",
-    };
-
-    let random_user = User {
-        id: rng.gen_range(0, 9999999),
-        name: rng.sample_iter(Alphanumeric).take(10).collect(),
-        role: admin_user.to_owned(),
-        age: rng.gen_range(1, 15),
-        created_at: Utc::now(),
-    };
-
-    parsed.push(random_user);
-    fs::write(DB_PATH, &serde_json::to_vec(&parsed)?)?;
-    Ok(parsed)
-}
-
-fn remove_user_at_index(user_list_state: &mut ListState) -> Result<(), Error> {
-    if let Some(selected) = user_list_state.selected() {
-        let db_content = fs::read_to_string(DB_PATH)?;
-        let mut parsed: Vec<User> = serde_json::from_str(&db_content)?;
-        parsed.remove(selected);
-        fs::write(DB_PATH, &serde_json::to_vec(&parsed)?)?;
-        if selected > 0 {
-            user_list_state.select(Some(selected - 1));
-        } else {
-            user_list_state.select(Some(0));
-        }
-    }
-    Ok(())
+    (list, topic_detail)
 }
